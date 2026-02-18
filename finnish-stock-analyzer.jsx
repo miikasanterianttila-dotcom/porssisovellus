@@ -64,6 +64,32 @@ async function fetchFMPBalanceSheet(ticker, years = 5) {
   return await res.json();
 }
 
+// Search for Helsinki stocks on FMP
+async function searchHelsinkiStocks(query) {
+  if (!hasApiKey() || !query.trim()) return [];
+  
+  // FMP search endpoint - returns matches from all exchanges
+  const res = await fetch(`${FMP_BASE}/search?query=${encodeURIComponent(query)}&limit=20&apikey=${API_KEY}`);
+  if (!res.ok) return [];
+  
+  const results = await res.json();
+  
+  // Filter for Helsinki exchange (HEL) stocks only
+  // FMP uses "exchangeShortName": "HEL" for Helsinki
+  const helsinkiStocks = results.filter(r => 
+    r.exchangeShortName === "HEL" || 
+    r.symbol?.endsWith(".HE")
+  ).map(r => ({
+    ticker: r.symbol.endsWith(".HE") ? r.symbol : r.symbol + ".HE",
+    name: r.name || r.symbol,
+    sector: "Nasdaq Helsinki",
+    logo: "📈",
+    _live: true
+  }));
+  
+  return helsinkiStocks.slice(0, 10); // Max 10 results
+}
+
 // Combine all FMP endpoints into the app's internal data shape
 async function fetchStockData(ticker) {
   const t = toHelsinkiTicker(ticker);
@@ -320,9 +346,18 @@ export default function App() {
   const [liveStock, setLiveStock] = useState(null);
   const [apiLoading, setApiLoading] = useState(false);
   const [apiError, setApiError] = useState(null);
+  const [searchLoading, setSearchLoading] = useState(false);
 
   const inputRef = useRef();
+  const searchTimeoutRef = useRef(null);
   const apiKeyPresent = hasApiKey();
+
+  // Cleanup search timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
+    };
+  }, []);
 
   // When API key is present, fetch real data on ticker change
   useEffect(() => {
@@ -345,23 +380,47 @@ export default function App() {
   const years = Object.keys(stock.years).map(Number).sort((a, b) => a - b);
   const inWatchlist = watchlist.includes(selected);
 
-  // Search: always searches mock keys; with API key also allows free-text .HE lookup
+  // Search: with API key, searches FMP live; without API key, searches mock data only
+  // Debounced to avoid spamming the API
   function handleSearch(val) {
     setQuery(val);
-    if (!val.trim()) { setSuggestions([]); return; }
-    const local = Object.values(MOCK_STOCKS).filter(s =>
-      s.ticker.toLowerCase().includes(val.toLowerCase()) ||
-      s.name.toLowerCase().includes(val.toLowerCase())
-    );
-    // Show a "live search" entry if the input looks like a ticker and we have an API key
-    const looksLikeTicker = /^[A-Za-z0-9]{2,8}$/.test(val.trim());
-    const heTickerSuggestion = apiKeyPresent && looksLikeTicker
-      ? [{ ticker: toHelsinkiTicker(val), name: `Hae: ${toHelsinkiTicker(val)}`, sector: "Nasdaq Helsinki", logo: "🔍", _live: true }]
-      : [];
-    const merged = [...local];
-    // Add live suggestion only if not already in mock results
-    heTickerSuggestion.forEach(s => { if (!merged.find(m => m.ticker === s.ticker)) merged.push(s); });
-    setSuggestions(merged);
+    if (!val.trim()) { 
+      setSuggestions([]);
+      setSearchLoading(false);
+      if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
+      return; 
+    }
+    
+    // Clear previous timeout
+    if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
+    
+    // If API key is present, do live search with debounce
+    if (apiKeyPresent) {
+      setSearchLoading(true);
+      searchTimeoutRef.current = setTimeout(async () => {
+        try {
+          const liveResults = await searchHelsinkiStocks(val);
+          setSuggestions(liveResults);
+          setSearchLoading(false);
+        } catch (err) {
+          console.error("Search failed:", err);
+          // Fallback to mock if search fails
+          const local = Object.values(MOCK_STOCKS).filter(s =>
+            s.ticker.toLowerCase().includes(val.toLowerCase()) ||
+            s.name.toLowerCase().includes(val.toLowerCase())
+          );
+          setSuggestions(local);
+          setSearchLoading(false);
+        }
+      }, 400); // 400ms debounce
+    } else {
+      // No API key — search only mock stocks (instant, no debounce needed)
+      const local = Object.values(MOCK_STOCKS).filter(s =>
+        s.ticker.toLowerCase().includes(val.toLowerCase()) ||
+        s.name.toLowerCase().includes(val.toLowerCase())
+      );
+      setSuggestions(local);
+    }
   }
 
   function selectStock(ticker) { setSelected(ticker); setQuery(""); setSuggestions([]); }
@@ -468,25 +527,32 @@ export default function App() {
               onFocus={e => e.target.style.borderColor = C.blue}
               onBlur={e => e.target.style.borderColor = C.blueBorder}
             />
-            {suggestions.length > 0 && (
+            {(searchLoading || suggestions.length > 0) && (
               <div style={{
                 position: "absolute", top: "calc(100% + 4px)", left: 0, right: 0, zIndex: 50,
                 background: C.white, border: `1.5px solid ${C.blueBorder}`,
                 borderRadius: 12, overflow: "hidden", boxShadow: "0 8px 28px rgba(0,53,128,0.14)"
               }}>
-                {suggestions.map(s => (
-                  <button key={s.ticker} onClick={() => selectStock(s.ticker)}
-                    style={{ width: "100%", padding: "10px 16px", display: "flex", alignItems: "center", gap: 10, background: "none", border: "none", cursor: "pointer", borderBottom: `1px solid ${C.bluePale}`, textAlign: "left" }}
-                    onMouseEnter={e => e.currentTarget.style.background = C.bluePale}
-                    onMouseLeave={e => e.currentTarget.style.background = "none"}
-                  >
-                    <span style={{ fontSize: 20 }}>{s.logo}</span>
-                    <div>
-                      <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{s.name}</div>
-                      <div style={{ fontSize: 11, color: C.textLight }}>{s.ticker} · {s.sector}</div>
-                    </div>
-                  </button>
-                ))}
+                {searchLoading ? (
+                  <div style={{ padding: "16px", display: "flex", alignItems: "center", gap: 10, color: C.textMid }}>
+                    <div style={{ width: 16, height: 16, border: `2px solid ${C.blueBorder}`, borderTopColor: C.blue, borderRadius: "50%", animation: "spin 0.6s linear infinite" }} />
+                    <span style={{ fontSize: 12 }}>Etsitään Helsinki-osakkeita…</span>
+                  </div>
+                ) : (
+                  suggestions.map(s => (
+                    <button key={s.ticker} onClick={() => selectStock(s.ticker)}
+                      style={{ width: "100%", padding: "10px 16px", display: "flex", alignItems: "center", gap: 10, background: "none", border: "none", cursor: "pointer", borderBottom: `1px solid ${C.bluePale}`, textAlign: "left" }}
+                      onMouseEnter={e => e.currentTarget.style.background = C.bluePale}
+                      onMouseLeave={e => e.currentTarget.style.background = "none"}
+                    >
+                      <span style={{ fontSize: 20 }}>{s.logo}</span>
+                      <div>
+                        <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{s.name}</div>
+                        <div style={{ fontSize: 11, color: C.textLight }}>{s.ticker} · {s.sector}</div>
+                      </div>
+                    </button>
+                  ))
+                )}
               </div>
             )}
           </div>
